@@ -14,6 +14,7 @@ import {
 import {
   parseGhPrList,
   parseGitLogOneline,
+  shouldAllowGhFailure,
 } from "../scripts/list-releases-since-tag.ts";
 
 describe("classifyTitle", () => {
@@ -157,5 +158,23 @@ describe("parseGitLogOneline + parseGhPrList", () => {
       { number: 1, title: "x", mergedAt: "t" },
     ]));
     expect(out[0]?.labels).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Echo's review on release-manager#2 — gh failure must propagate by default
+// (release-critical tool failing open is the wrong default).
+// ---------------------------------------------------------------------------
+
+describe("shouldAllowGhFailure (Echo major #4)", () => {
+  it("returns false by default (gh failure propagates)", () => {
+    expect(shouldAllowGhFailure({})).toBe(false);
+    expect(shouldAllowGhFailure({ MF_ALLOW_GH_FAILURE: "" })).toBe(false);
+    expect(shouldAllowGhFailure({ MF_ALLOW_GH_FAILURE: "0" })).toBe(false);
+    expect(shouldAllowGhFailure({ MF_ALLOW_GH_FAILURE: "true" })).toBe(false);
+  });
+
+  it("returns true only when MF_ALLOW_GH_FAILURE === '1'", () => {
+    expect(shouldAllowGhFailure({ MF_ALLOW_GH_FAILURE: "1" })).toBe(true);
   });
 });

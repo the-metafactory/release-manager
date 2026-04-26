@@ -56,6 +56,18 @@ export function defaultRepoPath(): string {
   return resolve(homedir(), "Developer", "grove");
 }
 
+/**
+ * Whether to allow `gh` failures to silently produce an empty PR list, instead
+ * of throwing. Default OFF (per Echo's review on release-manager#2) — release
+ * tooling must not fail open. Tests that want to exercise the legacy
+ * permissive behavior set MF_ALLOW_GH_FAILURE=1 explicitly.
+ */
+export function shouldAllowGhFailure(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return env["MF_ALLOW_GH_FAILURE"] === "1";
+}
+
 /** Parse `git log --oneline TAG..HEAD` output into commit entries. */
 export function parseGitLogOneline(output: string): CommitEntry[] {
   const lines = output.split("\n").filter((l) => l.trim().length > 0);
@@ -144,15 +156,34 @@ export function listReleasesSinceTag(
       try {
         prs = parseGhPrList(ghResult.stdout);
       } catch (err) {
-        process.stderr.write(
-          `list-releases-since-tag: failed to parse gh output (${(err as Error).message})\n`,
-        );
+        // Per Echo's review on release-manager#2: a parse failure means the
+        // changelog would silently lose merged PRs. That's a release-critical
+        // failure-open path. Propagate by default; the env opt-in keeps the
+        // permissive behavior available for test environments.
+        const message = `list-releases-since-tag: failed to parse gh output (${(err as Error).message})`;
+        if (shouldAllowGhFailure()) {
+          process.stderr.write(`${message} — continuing because MF_ALLOW_GH_FAILURE=1\n`);
+        } else {
+          throw new Error(`${message} (set MF_ALLOW_GH_FAILURE=1 to suppress)`);
+        }
       }
     } else if (ghResult.status !== 0) {
-      // Don't hard-fail — gh may not be configured in test environments.
-      process.stderr.write(
-        `list-releases-since-tag: gh pr list failed (status=${ghResult.status}); continuing with empty PR list\n`,
-      );
+      // Per Echo's review on release-manager#2: silently producing an empty
+      // PR list when `gh` fails means release notes can lose every PR without
+      // the operator noticing. Propagate by default; gate the legacy
+      // permissive behavior behind MF_ALLOW_GH_FAILURE=1 for test environments
+      // that intentionally don't have gh configured.
+      const stderr = (ghResult.stderr ?? "").trim();
+      const message =
+        `list-releases-since-tag: gh pr list failed (status=${ghResult.status})` +
+        (stderr ? `: ${stderr}` : "");
+      if (shouldAllowGhFailure()) {
+        process.stderr.write(
+          `${message}; continuing with empty PR list because MF_ALLOW_GH_FAILURE=1\n`,
+        );
+      } else {
+        throw new Error(`${message} (set MF_ALLOW_GH_FAILURE=1 to suppress)`);
+      }
     }
   }
 

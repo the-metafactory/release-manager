@@ -6,6 +6,18 @@
  * and run each gate row's "How To Verify" command via Bash. Emit a structured
  * JSON report.
  *
+ * TRUST BOUNDARY (per Echo's review on release-manager#2):
+ *   The verify cells in `release-checklist.md` are operator-editable markdown.
+ *   Today compass is internal but the file is still treated as untrusted code
+ *   here — anyone who can open a PR against compass would otherwise be able
+ *   to run arbitrary shell on the release operator's machine. We mitigate via:
+ *     1. Allowlist regex in VERIFY_COMMAND_ALLOWLIST — verify cells whose
+ *        command does NOT match are recorded as `fail` with a clear reason
+ *        rather than executed.
+ *     2. 30-second timeout on each spawnSync.
+ *     3. Empty-rows / unparseable-table = fail-closed (NOT fail-open).
+ *   See skill/Workflows/TrustGateCheck.md for the documented contract.
+ *
  * Usage:
  *   bun scripts/check-gate-table.ts [--milestone <S2-22|S2-30|S2-32|external-onramp>] [--dry-run] [--checklist <path>]
  *
@@ -22,7 +34,9 @@
  * Output:
  *   JSON {
  *     gates: [{ id, gateNumber, gateLabel, milestone, name, verify, status, output? }],
- *     allPassed: bool
+ *     allPassed: bool,
+ *     reason?: string,           // populated when allPassed=false (or empty rows)
+ *     manualGatesPending: number // count of skipped non-dry-run rows requiring human follow-up
  *   }
  *
  * TODO(v0.2): generalize for non-grove repos. Several rows hard-code grove
@@ -76,6 +90,27 @@ export interface GateResult extends GateRow {
 export interface CheckGateReport {
   gates: GateResult[];
   allPassed: boolean;
+  /** When allPassed=false, a short human-readable reason. Omitted when allPassed=true. */
+  reason?: string;
+  /** Count of skipped rows (non-dry-run) that represent manual gates still requiring human follow-up. */
+  manualGatesPending: number;
+}
+
+/**
+ * Allowlist of command prefixes permitted in verify cells (per Echo's review on
+ * release-manager#2). Verify cells whose unwrapped command does not match this
+ * regex are recorded as `fail` with reason "verify command not in allowlist —
+ * manual review required" rather than being executed.
+ *
+ * Add new prefixes here only after the new command shape is reviewed in the
+ * `release-checklist.md` PR — never widen the allowlist to make a single cell
+ * pass.
+ */
+export const VERIFY_COMMAND_ALLOWLIST =
+  /^(gh\s|git\s|bun\s|bunx\s|test\s|\[\s|!\s|find\s|grep\s|cat\s|wc\s|stat\s|ls\s|echo\s|curl\s|true|false)/;
+
+export function isVerifyCommandAllowed(command: string): boolean {
+  return VERIFY_COMMAND_ALLOWLIST.test(command.trim());
 }
 
 export function defaultChecklistPath(): string {
@@ -109,8 +144,12 @@ export function parseGateTable(markdown: string): GateRow[] {
       currentGate = Number(gateHeader[1]);
       continue;
     }
-    // Phase 1 header ends Phase 0.
-    if (/^##\s+Phase\s+1:/i.test(line)) break;
+    // Phase 0 ends at the next H2 header — but only after we've seen at least
+    // one gate row, so leading H2s before Phase 0 (e.g. "## Overview") don't
+    // terminate the scan early. Per Echo's review on release-manager#2:
+    // structurally the contract is "Phase 0 ends at the next H2", not "ends
+    // at Phase 1 specifically" — the latter silently swallows reorgs.
+    if (rows.length > 0 && /^##\s/.test(line) && !/^###/.test(line)) break;
 
     if (!currentGate) continue;
 
@@ -152,6 +191,19 @@ export function runGateRow(row: GateRow, opts: RunGateOptions = {}): GateResult 
     };
   }
   const command = unwrapBacktickCommand(row.verify);
+  // Per Echo's review on release-manager#2 — verify cells originate in compass
+  // markdown which is internal but operator-editable; we treat them as
+  // untrusted. Any command not matching VERIFY_COMMAND_ALLOWLIST is rejected
+  // here rather than being passed to bash -c.
+  if (!isVerifyCommandAllowed(command)) {
+    return {
+      ...row,
+      status: "fail",
+      output:
+        "verify command not in allowlist — manual review required " +
+        "(see VERIFY_COMMAND_ALLOWLIST in scripts/check-gate-table.ts)",
+    };
+  }
   const result = spawnSync("bash", ["-c", command], {
     encoding: "utf8",
     timeout: opts.timeoutMs ?? 30_000,
@@ -176,9 +228,74 @@ export function runChecklist(
   const filtered = opts.milestone
     ? rows.filter((r) => r.milestone === opts.milestone)
     : rows;
+
+  // FAIL-CLOSED on empty rows. Per Echo's review on release-manager#2: the
+  // single most important rule of the trust gate is "halt on first fail" —
+  // and an unparseable / missing / restructured table must be the loudest
+  // possible failure, never a silent green light. The OLD code returned
+  // allPassed=true here because `[].every(...)` returns true; that was the
+  // blocker.
+  if (filtered.length === 0) {
+    const milestoneSuffix = opts.milestone ? ` for milestone ${opts.milestone}` : "";
+    return {
+      gates: [],
+      allPassed: false,
+      reason:
+        "no gates parsed — milestone table missing or table format unrecognized" +
+        milestoneSuffix,
+      manualGatesPending: 0,
+    };
+  }
+
   const results = filtered.map((row) => runGateRow(row, opts));
-  const allPassed = results.every((r) => r.status === "pass" || r.status === "skipped");
-  return { gates: results, allPassed };
+
+  // Distinguish three states (per Echo's review on release-manager#2):
+  //   - allPassed=true requires ≥1 executed pass AND zero fails.
+  //   - skipped rows do NOT count toward green; they surface as
+  //     manualGatesPending so the workflow consumer knows a human gate is
+  //     still owed.
+  //   - In dry-run mode every row is "skipped" by design, so don't classify
+  //     dry-run skips as pending manual work.
+  const passes = results.filter((r) => r.status === "pass").length;
+  const fails = results.filter((r) => r.status === "fail").length;
+  const skipped = results.filter((r) => r.status === "skipped").length;
+  const manualGatesPending = opts.dryRun ? 0 : skipped;
+
+  if (opts.dryRun) {
+    // Dry-run is informational; don't flip allPassed off just because nothing
+    // ran. Operator knows --dry-run means "parse and inspect", not "verify".
+    return {
+      gates: results,
+      allPassed: true,
+      manualGatesPending,
+    };
+  }
+
+  if (fails > 0) {
+    return {
+      gates: results,
+      allPassed: false,
+      reason: `${fails} gate row(s) failed — see gates[].status='fail'`,
+      manualGatesPending,
+    };
+  }
+
+  if (passes === 0) {
+    return {
+      gates: results,
+      allPassed: false,
+      reason:
+        `no executed passes — ${skipped} skipped (manual) row(s) require ` +
+        `human follow-up before allPassed can be true`,
+      manualGatesPending,
+    };
+  }
+
+  return {
+    gates: results,
+    allPassed: true,
+    manualGatesPending,
+  };
 }
 
 interface ParsedArgs {
@@ -249,6 +366,9 @@ function main(): number {
     milestone: args.milestone,
   });
   process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+  if (!report.allPassed && report.reason) {
+    process.stderr.write(`check-gate-table: ${report.reason}\n`);
+  }
   return report.allPassed ? 0 : 1;
 }
 

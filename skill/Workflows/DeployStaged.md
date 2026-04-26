@@ -7,7 +7,7 @@ Deploy to dev, smoke-test, then (in a **separate** workflow run) deploy to produ
 ## Pre-flight
 
 - The release tag from `CutRelease` exists on `origin`.
-- `TrustGateCheck` (if applicable to this milestone) has reported `allPassed: true`.
+- `TrustGateCheck` (if applicable to this milestone) has reported `allPassed: true` AND `manualGatesPending: 0` (or every pending manual gate has been explicitly acknowledged in the release thread).
 - The operator has explicitly invoked this workflow with an `env` argument: `dev` or `production`.
 
 ## Action

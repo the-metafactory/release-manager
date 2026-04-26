@@ -17,14 +17,12 @@ Codifies `compass/sops/release-checklist.md` lines 212–244. Revert production 
    gh release list --repo the-metafactory/grove --limit 5
    ```
    Default to the tag immediately preceding the current production tag unless the operator overrides.
-2. Check out the tag in the release worktree (never on main):
-   ```bash
-   git -C ~/Developer/release-manager-mvp checkout v<previous>
-   ```
-   Or, for grove specifically:
+2. Check out the tag in the grove repo (never on main):
    ```bash
    git -C ~/Developer/grove checkout v<previous>
    ```
+   Day-one scope is grove only; `~/Developer/grove` is the only correct deploy
+   source. (v0.2 will introduce per-repo deploy targets.)
 3. Re-deploy production from that tag:
    ```bash
    bunx wrangler deploy --env production
