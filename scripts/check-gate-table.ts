@@ -6,16 +6,23 @@
  * and run each gate row's "How To Verify" command via Bash. Emit a structured
  * JSON report.
  *
- * TRUST BOUNDARY (per Echo's review on release-manager#2):
+ * TRUST BOUNDARY (per Echo's review + sweep on release-manager#2):
  *   The verify cells in `release-checklist.md` are operator-editable markdown.
  *   Today compass is internal but the file is still treated as untrusted code
  *   here — anyone who can open a PR against compass would otherwise be able
  *   to run arbitrary shell on the release operator's machine. We mitigate via:
- *     1. Allowlist regex in VERIFY_COMMAND_ALLOWLIST — verify cells whose
- *        command does NOT match are recorded as `fail` with a clear reason
- *        rather than executed.
- *     2. 30-second timeout on each spawnSync.
- *     3. Empty-rows / unparseable-table = fail-closed (NOT fail-open).
+ *     1. Shell-metacharacter rejection (SHELL_METACHARACTER_RE) — any cell
+ *        containing `;`, `&`, `|`, `$`, backtick, `>`, `<`, newline, `(`,
+ *        `)`, or `\` fails closed before tokenization.
+ *     2. Deliberate tokenizer (tokenizeVerifyCommand) — no shell-quote dep,
+ *        no shell expansion, just whitespace + single/double quoted strings.
+ *     3. Direct spawnSync(program, args) — NEVER `bash -c`. The shell is
+ *        never invoked, so chained / redirected / substituted commands
+ *        cannot be interpreted even if a metacharacter slipped past step 1.
+ *     4. Allowlist regex in VERIFY_COMMAND_ALLOWLIST — defense in depth on
+ *        the first token (rejects unknown binaries like `eval`, `nc`).
+ *     5. 30-second timeout on each spawnSync.
+ *     6. Empty-rows / unparseable-table = fail-closed (NOT fail-open).
  *   See skill/Workflows/TrustGateCheck.md for the documented contract.
  *
  * Usage:
@@ -105,12 +112,95 @@ export interface CheckGateReport {
  * Add new prefixes here only after the new command shape is reviewed in the
  * `release-checklist.md` PR — never widen the allowlist to make a single cell
  * pass.
+ *
+ * NOTE: this regex is now an *additional* gate, not the primary defense.
+ * Echo's sweep follow-up on release-manager#2 (2026-04-26): the original
+ * implementation handed the unwrapped command string to `bash -c`, which
+ * happily executed anything an attacker appended after an allowlisted
+ * prefix (e.g. `gh issue view 22 ; rm -rf ~` matched `^gh\s` and bash ran
+ * both halves). The fix below routes verify cells through a
+ * shell-metacharacter rejection step + a deliberate tokenizer + direct
+ * `spawnSync(prog, args)` — no shell at all. The allowlist remains as
+ * belt-and-braces.
  */
 export const VERIFY_COMMAND_ALLOWLIST =
   /^(gh\s|git\s|bun\s|bunx\s|test\s|\[\s|!\s|find\s|grep\s|cat\s|wc\s|stat\s|ls\s|echo\s|curl\s|true|false)/;
 
 export function isVerifyCommandAllowed(command: string): boolean {
   return VERIFY_COMMAND_ALLOWLIST.test(command.trim());
+}
+
+/**
+ * Defense in depth (Echo sweep on release-manager#2): refuse cells whose
+ * unwrapped command contains any character that bash would interpret as
+ * control flow, redirection, expansion, or command substitution. We never
+ * reach a shell at runtime, but rejecting these characters up-front means
+ * the operator gets a clear "shell metacharacters" failure and the bug is
+ * impossible to reintroduce by accident if a future maintainer brings back
+ * `bash -c`.
+ *
+ * Rejected: `;` `&` `|` `$` `` ` `` `>` `<` newline `(` `)` `\` (also `\r`).
+ * `(`/`)` are rejected because bash uses them for subshells and process
+ * substitution; verify cells have never legitimately needed them.
+ */
+export const SHELL_METACHARACTER_RE = /[;&|$`><\n\r()\\]/;
+
+export function containsShellMetacharacters(command: string): boolean {
+  return SHELL_METACHARACTER_RE.test(command);
+}
+
+/**
+ * Tokenize a verify-cell command into program + args without invoking any
+ * shell. Supports unquoted whitespace-separated tokens and single- or
+ * double-quoted strings (no escapes inside quotes — verify cells don't need
+ * them, and rejecting `\` at the metacharacter step means we never see one
+ * here anyway). Throws on anything it can't deterministically tokenize so
+ * the caller can record a structured fail.
+ *
+ * This is a deliberate purpose-built tokenizer rather than a shell-parsing
+ * library: the input grammar is small (release-checklist verify cells), the
+ * threat model is "operator-editable markdown is untrusted", and we want
+ * the tokenizer to refuse weird inputs by construction.
+ */
+export function tokenizeVerifyCommand(command: string): string[] {
+  const tokens: string[] = [];
+  let i = 0;
+  const n = command.length;
+  while (i < n) {
+    const c = command[i];
+    if (c === " " || c === "\t") {
+      i++;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      const quote = c;
+      i++;
+      let buf = "";
+      while (i < n && command[i] !== quote) {
+        buf += command[i];
+        i++;
+      }
+      if (i >= n) {
+        throw new Error(`unterminated ${quote === "'" ? "single" : "double"} quote`);
+      }
+      i++; // consume closing quote
+      tokens.push(buf);
+      continue;
+    }
+    // Unquoted token — read up to next whitespace. Metacharacters are
+    // already rejected by containsShellMetacharacters() before we get here.
+    let buf = "";
+    while (i < n && command[i] !== " " && command[i] !== "\t") {
+      const ch = command[i];
+      if (ch === "'" || ch === '"') {
+        throw new Error("unexpected quote inside unquoted token");
+      }
+      buf += ch;
+      i++;
+    }
+    if (buf.length > 0) tokens.push(buf);
+  }
+  return tokens;
 }
 
 export function defaultChecklistPath(): string {
@@ -193,8 +283,36 @@ export function runGateRow(row: GateRow, opts: RunGateOptions = {}): GateResult 
   const command = unwrapBacktickCommand(row.verify);
   // Per Echo's review on release-manager#2 — verify cells originate in compass
   // markdown which is internal but operator-editable; we treat them as
-  // untrusted. Any command not matching VERIFY_COMMAND_ALLOWLIST is rejected
-  // here rather than being passed to bash -c.
+  // untrusted. The trust gate applies three layers in order:
+  //
+  //   1. Reject any cell containing shell metacharacters (`;`, `&`, `|`,
+  //      `$`, backtick, `>`, `<`, newline, `(`, `)`, `\`). Echo's sweep
+  //      follow-up (2026-04-26) caught a chaining bug where the original
+  //      prefix-only allowlist accepted `gh issue view 22 ; rm -rf ~` and
+  //      then `bash -c` ran both halves. Rejecting these characters first
+  //      makes that vector impossible regardless of how the rest of the
+  //      pipeline evolves.
+  //
+  //   2. Tokenize the command without a shell.
+  //
+  //   3. Match the first token against VERIFY_COMMAND_ALLOWLIST as a
+  //      defense-in-depth gate (now redundant with step 1+2 for shell
+  //      injection, but still useful to keep `nc`, `eval`, `python` etc.
+  //      out of verify cells).
+  //
+  // We then run the resolved program directly via spawnSync(prog, args) —
+  // never `bash -c` — so even if a metacharacter slipped through somehow
+  // it would be passed as a literal arg to the program, not interpreted.
+  if (containsShellMetacharacters(command)) {
+    return {
+      ...row,
+      status: "fail",
+      output:
+        "verify cell contains shell metacharacters — manual review required " +
+        "(operator-editable markdown is untrusted; see SHELL_METACHARACTER_RE " +
+        "in scripts/check-gate-table.ts)",
+    };
+  }
   if (!isVerifyCommandAllowed(command)) {
     return {
       ...row,
@@ -204,7 +322,26 @@ export function runGateRow(row: GateRow, opts: RunGateOptions = {}): GateResult 
         "(see VERIFY_COMMAND_ALLOWLIST in scripts/check-gate-table.ts)",
     };
   }
-  const result = spawnSync("bash", ["-c", command], {
+  let tokens: string[];
+  try {
+    tokens = tokenizeVerifyCommand(command);
+  } catch (err) {
+    return {
+      ...row,
+      status: "fail",
+      output: `verify cell could not be tokenized: ${(err as Error).message}`,
+    };
+  }
+  const program = tokens[0];
+  if (!program) {
+    return {
+      ...row,
+      status: "fail",
+      output: "verify cell tokenized to zero tokens",
+    };
+  }
+  const args = tokens.slice(1);
+  const result = spawnSync(program, args, {
     encoding: "utf8",
     timeout: opts.timeoutMs ?? 30_000,
   });

