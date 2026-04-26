@@ -1,0 +1,6 @@
+# Scripts ship in Phase 3 (see iteration tracking issue).
+#
+# Planned files (bun-runnable TypeScript):
+#   list-releases-since-tag.ts
+#   prepare-changelog.ts
+#   check-gate-table.ts

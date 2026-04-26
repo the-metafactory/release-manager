@@ -1,0 +1,23 @@
+schema: pai/v1
+type: skill
+namespace: metafactory
+name: ReleaseManager
+version: 0.1.0
+description: "Release SOP walker — bump → tag → bundle → publish → deploy → announce. The skill bundle Forge composes for end-to-end releases."
+author:
+  name: metafactory
+  github: the-metafactory
+repository: "the-metafactory/release-manager"
+
+# Day-one scope: grove only. Generalising to other repos is a Phase G iteration.
+# Workflows + scripts ship in Phase 3 — see Iteration 1 issue.
+
+provides:
+  skill:
+    - trigger: "release"
+    - trigger: "bump version"
+    - trigger: "cut release"
+    - trigger: "deploy staged"
+    - trigger: "trust gate check"
+    - trigger: "rollback release"
+    - trigger: "announce release"

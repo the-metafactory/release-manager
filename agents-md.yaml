@@ -1,0 +1,25 @@
+# agents-md.yaml — repo-specific agent rules configuration
+# Used by `arc upgrade compass` to generate agent rule files.
+# See compass/docs/design-claude-md-sync.md for the full design spec.
+
+template: compass-standards
+
+generate:
+  - format: claude-md
+
+# Placeholder values (substituted into templates)
+repo_name: release-manager
+repo_description: "Release SOP walker — bump → tag → bundle → publish → deploy → announce. The skill bundle Forge composes for end-to-end releases."
+deploy_command: "arc upgrade release-manager"
+version_source: arc-manifest.yaml
+release_title_format: '"release-manager vX.Y.Z — Short Description"'
+worktree_pattern: "../release-manager-{slug}"
+sop_path_prefix: "compass/"
+repo_short: release-manager
+
+# Repo-specific sections injected at marked positions in the template
+sections:
+  - position: "after:description"
+    file: docs/agents-md/architecture.md
+  - position: "after:critical-rules"
+    file: docs/agents-md/critical-rules.md
