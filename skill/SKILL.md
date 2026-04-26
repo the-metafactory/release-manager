@@ -18,21 +18,49 @@ triggers:
 
 # ReleaseManager
 
-> **Status: scaffold (Phase 1).** Workflows + scripts implementation lands in Phase 3 — see the iteration tracking issue on `the-metafactory/release-manager`.
+> **Status:** MVP (Phase 3 of meta-factory#390). Six workflows + three scripts shipped for the day-one grove scope. ScaffoldInstance lives in the `AgentState` bundle, not here.
 
-This file is the entry point an agent loads when any of the trigger phrases above appears. The full implementation is split across `Workflows/` and `scripts/`.
+This file is the entry point an agent loads when any of the trigger phrases above appears. The full implementation is split across `Workflows/` (action / verify / anti-pattern triplets) and `../scripts/` (bun-runnable CLIs).
 
 ## Overview
 
-ReleaseManager walks the seven release workflows in order:
+ReleaseManager walks the six release workflows in order. Each workflow MD has the same structure: **Pre-flight**, **Action**, **Verify**, **Anti-pattern**.
 
-1. **BumpVersion** — derive patch/minor/major from the commit log, edit `arc-manifest.yaml`, commit.
-2. **CutRelease** — tag, push, create the GitHub release with generated notes.
-3. **TrustGateCheck** — run the gate table; halt on first failure.
-4. **DeployStaged** — dev first, then prompt-then-prod (separate workflow run for prod).
-5. **Rollback** — revert a deploy by re-tagging the previous version.
-6. **Announce** — post a one-liner to the Discord entity thread linking to the GitHub release.
-7. **ScaffoldInstance** — create per-instance state folders (calls `AgentState/ScaffoldFolders`).
+| # | Workflow                                      | Purpose                                                                          |
+|---|-----------------------------------------------|----------------------------------------------------------------------------------|
+| 1 | [BumpVersion](Workflows/BumpVersion.md)       | Decide patch/minor/major from commit prefixes; edit `arc-manifest.yaml`; commit. |
+| 2 | [CutRelease](Workflows/CutRelease.md)         | Tag, push, create the GitHub release with generated notes.                       |
+| 3 | [TrustGateCheck](Workflows/TrustGateCheck.md) | Walk the trust-gate table; halt on first failure.                                |
+| 4 | [DeployStaged](Workflows/DeployStaged.md)     | Dev first, smoke-test, then prompt-then-prod (separate workflow run for prod).   |
+| 5 | [Rollback](Workflows/Rollback.md)             | Revert prod to a known-good prior tag; record cause in events.                   |
+| 6 | [Announce](Workflows/Announce.md)             | Post structured release note to Discord + tracking issue. **Always last.**       |
+
+**ScaffoldInstance** (per-instance state folders) is **not** in this bundle — it lives in [AgentState](https://github.com/the-metafactory/agent-state). ReleaseManager assumes the instance state directory already exists.
+
+## Routing
+
+When a trigger phrase appears, route to the relevant workflow file by intent:
+
+- "bump", "version" → BumpVersion
+- "cut", "tag", "release" → CutRelease
+- "trust gate", "phase 0", "release-checklist" → TrustGateCheck
+- "deploy", "ship dev", "ship prod" → DeployStaged
+- "rollback", "revert deploy" → Rollback
+- "announce", "post release" → Announce
+
+If the operator says "release" without specifying a workflow, walk all six in order, pausing for operator confirm at each gate.
+
+## Scripts
+
+Three bun CLIs ship under `../scripts/`. All accept `<repo-path>` as first arg; default is `$MF_TARGET_REPO` or `~/Developer/grove`.
+
+| Script                       | Purpose                                                                     |
+|------------------------------|-----------------------------------------------------------------------------|
+| `list-releases-since-tag.ts` | Enumerate commits + merged PRs since a tag; emit JSON.                      |
+| `prepare-changelog.ts`       | Group PRs by conventional-commit prefix; emit release-note markdown.        |
+| `check-gate-table.ts`        | Parse `compass/sops/release-checklist.md` Phase 0 table; run gates per-row. |
+
+See each script's `--help` for the full usage.
 
 ## Critical rules
 
@@ -41,14 +69,6 @@ See `docs/agents-md/critical-rules.md` in this repo. Summary:
 - Production deploys are **always** a separate workflow run.
 - Trust-gate failures are **blocking**, not advisory.
 - Day-one scope is **grove only** — no per-repo branching.
-- `arc publish --dry-run` runs **first**; real publish only after operator confirm.
+- `arc publish --dry-run` runs **first** for any publish workflow (not in scope for this PR; lands in the next iteration).
 - Never edit `arc-manifest.yaml` without showing the diff + bump rationale.
-
-## Phase 3 deliverables
-
-Tracked in the `Iteration 1 — ReleaseManager MVP` issue on this repo:
-
-- 7 workflow files in `Workflows/`
-- 3 scripts in `../scripts/`
-- Tests for each script
-- `arc publish --dry-run` to dev and verified
+- Production rollbacks must record the cause in the events pipeline.
