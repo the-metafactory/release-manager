@@ -1,23 +1,57 @@
-schema: pai/v1
-type: skill
-namespace: metafactory
-name: ReleaseManager
+# arc-manifest.yaml — capability declaration
+# metafactory-skill-release-manager: the ReleaseManager skill — a Release SOP
+# walker (bump → tag → bundle → publish → deploy → announce). Category-A repo of
+# the skill-estate migration (the-metafactory/arc#316): renamed from
+# `release-manager` and normalized to the strict arc/v1 contract (spec §4.1/§4.2).
+# Distribution is repo-first (arc install from the git repo).
+schema: arc/v1
+name: release-manager
+namespace: "@metafactory"
 version: 0.1.0
+type: skill
+tier: custom
 description: "Release SOP walker — bump → tag → bundle → publish → deploy → announce. The skill bundle Forge composes for end-to-end releases."
+license: MIT
+repository: "the-metafactory/metafactory-skill-release-manager"
+
 author:
-  name: metafactory
-  github: the-metafactory
-repository: "the-metafactory/release-manager"
+  name: Andreas Aastroem
+  github: mellanon
 
 # Day-one scope: grove only. Generalising to other repos is a Phase G iteration.
-# Workflows + scripts ship in Phase 3 — see Iteration 1 issue.
-
 provides:
   skill:
-    - trigger: "release"
+    - name: ReleaseManager
+      path: skill/
+      trigger: "release"
     - trigger: "bump version"
     - trigger: "cut release"
     - trigger: "deploy staged"
     - trigger: "trust gate check"
     - trigger: "rollback release"
     - trigger: "announce release"
+
+# Capability surface (arc/v1 requires this block with explicit empties).
+capabilities:
+  # The skill operates on whichever target repo is being released (grove today),
+  # so it declares no fixed filesystem paths — its file access is mediated by the
+  # git/gh/bun commands it shells out to (see bash below).
+  filesystem:
+    read: []
+    write: []
+  # No direct network egress: the workflows and scripts reach GitHub/Discord only
+  # by shelling out to the `gh`, `git`, and `discord` CLIs, each of which declares
+  # its own surface. The skill's own code opens no sockets.
+  network: []
+  bash:
+    # The workflows and scripts shell out to git, gh, bun, and the discord CLI to
+    # bump versions, cut tags/releases, deploy, and announce.
+    allowed: true
+  secrets: []
+
+depends_on:
+  tools:
+    - name: bun
+
+bundle:
+  exclude: [vendor, MEMORY, node_modules, .git, Plans, test]
